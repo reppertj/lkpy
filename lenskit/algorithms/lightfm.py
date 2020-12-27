@@ -27,13 +27,12 @@ class LightFM(MFPredictor):
             The item index.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__()
 
         import lightfm
 
-        self.delegate = lightfm.LightFM(**self._kwargs)
-        self._kwargs = kwargs
+        self.delegate = lightfm.LightFM(*args, **kwargs)
 
     def fit(self, ratings, **kwargs):
         """[summary]
