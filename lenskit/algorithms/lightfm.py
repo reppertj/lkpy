@@ -2,6 +2,7 @@ import logging
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sps
 
 from ..matrix import sparse_ratings
 from . import Predictor
@@ -64,21 +65,13 @@ class LightFM(Predictor):
         Returns:
             [type] -- [description]
         """
-        if isinstance(ratings, pd.DataFrame):
-            ratings, users, items = sparse_ratings(ratings, scipy=True)
-            ratings = ratings.tocoo()  # TODO: Change after sparse_ratings refactor
-        elif isinstance(ratings, scipy.sparse.coo_matrix):
-            n_users, n_items = ratings.shape
-            users = pd.Index(np.arange(n_users), name="user")
-            items = pd.Index(np.arange(n_items), name="item")
-        else:
-            raise TypeError("unsupported type %s for ratings", type(ratings))
-
-        self.user_index_ = users
-        self.item_index_ = items
+        users, items = None, None
 
         if isinstance(user_features, pd.DataFrame):
-            if set(user_features.columns) - {'user', 'feature'} in [set(), {'value'}]:
+            users = pd.Index(
+                np.unique(pd.concat([ratings.user, user_features.user])), name="user"
+                )
+            if set(user_features.columns) - {"user", "feature"} in [set(), {"value"}]:
                 user_features_builder = self._build_features_long
             else:
                 user_features_builder = self._build_features_wide
@@ -89,9 +82,7 @@ class LightFM(Predictor):
                 user_identity_features,
                 normalize_user_features,
             )
-        elif user_features is None or isinstance(
-            user_features, scipy.sparse.coo_matrix
-        ):
+        elif user_features is None or sps.isspmatrix_coo(item_features):
             self.user_features_ = user_features
         else:
             raise TypeError(
@@ -99,7 +90,10 @@ class LightFM(Predictor):
             )
 
         if isinstance(item_features, pd.DataFrame):
-            if set(item_features.columns) - {'item', 'feature'} in [set(), {'value'}]:
+            items = pd.Index(
+                np.unique(pd.concat([ratings.item, item_features.item])), name="item"
+                )
+            if set(item_features.columns) - {"item", "feature"} in [set(), {"value"}]:
                 item_features_builder = self._build_features_long
             else:
                 item_features_builder = self._build_features_wide
@@ -110,14 +104,25 @@ class LightFM(Predictor):
                 item_identity_features,
                 normalize_item_features,
             )
-        elif item_features is None or isinstance(
-            item_features, scipy.sparse.coo_matrix
-        ):
+        elif item_features is None or sps.isspmatrix_coo(item_features):
             self.item_features_ = item_features
         else:
             raise TypeError(
                 "unsupported type %s for item features", type(item_features)
             )
+
+        if isinstance(ratings, pd.DataFrame):
+            ratings, users, items = sparse_ratings(ratings, scipy=True, users=users, items=items)
+            ratings = ratings.tocoo()  # TODO: Change after sparse_ratings refactor
+        elif sps.isspmatrix_coo(ratings):
+            n_users, n_items = ratings.shape
+            users = pd.Index(np.arange(n_users), name="user")
+            items = pd.Index(np.arange(n_items), name="item")
+        else:
+            raise TypeError("unsupported type %s for ratings", type(ratings))
+
+        self.user_index_ = users
+        self.item_index_ = items
 
         _logger.info("fitting LightFM model")
         self.delegate.fit(ratings, **kwargs)
@@ -183,7 +188,7 @@ class LightFM(Predictor):
         col_ind = feat_idx.get_indexer(features.feature).astype(np.intc)
 
         if "value" in features.columns:
-            data = np.require(ratings.rating.values, np.float32)
+            data = np.require(features["value"], np.float32)
         else:
             data = np.ones_like(col_ind, dtype=np.float32)
 
