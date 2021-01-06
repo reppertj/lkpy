@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sps
 
+
 from ..matrix import sparse_ratings
 from . import Predictor
 
@@ -28,15 +29,55 @@ class LightFM(Predictor):
     """
 
     def __init__(self, *args, **kwargs):
-        super().__init__()
 
         import lightfm
 
+        super().__init__()
         self.delegate = lightfm.LightFM(*args, **kwargs)
+        self._reset_state()
 
     def fit(
         self,
         ratings,
+        sample_weight_col=None,
+        user_features=None,
+        item_features=None,
+        user_identity_features=True,
+        item_identity_features=True,
+        normalize_user_features=True,
+        normalize_item_features=True,
+        **kwargs
+    ):
+        """[summary]
+
+        Arguments:
+            ratings {[type]} -- [description]
+
+        Keyword Arguments:
+            user_features {[type]} -- [description] (default: {None})
+            item_features {[type]} -- [description] (default: {None})
+            user_identity_features {bool} -- [description] (default: {True})
+            item_identity_features {bool} -- [description] (default: {True})
+            normalize_user_features {bool} -- [description] (default: {True})
+            normalize_item_features {bool} -- [description] (default: {True})
+        """
+        self._reset_state()
+        self.partial_fit(
+            ratings,
+            sample_weight_col=sample_weight_col,
+            user_features=user_features,
+            item_features=item_features,
+            user_identity_features=user_identity_features,
+            item_identity_features=item_identity_features,
+            normalize_user_features=normalize_user_features,
+            normalize_item_features=normalize_item_features,
+            **kwargs
+        )
+
+    def partial_fit(
+        self,
+        ratings,
+        sample_weight_col=None,
         user_features=None,
         item_features=None,
         user_identity_features=True,
@@ -65,71 +106,123 @@ class LightFM(Predictor):
         Returns:
             [type] -- [description]
         """
-        users, items = None, None
+        self._add_to_index(users_to_add=[ratings.user])
+        self._add_to_index(items_to_add=[ratings.item])
 
-        if isinstance(user_features, pd.DataFrame):
-            users = pd.Index(
-                np.unique(pd.concat([ratings.user, user_features.user])), name="user"
-                )
-            if set(user_features.columns) - {"user", "feature"} in [set(), {"value"}]:
-                user_features_builder = self._build_features_long
-            else:
-                user_features_builder = self._build_features_wide
-            self.user_features_ = user_features_builder(
-                users,
+        if user_features is not None:
+            self.user_features_ = self._process_user_features(
+                user_features, user_identity_features, normalize_user_features
+            )
+
+        if item_features is not None:
+            self.item_features_ = self._process_item_features(
+                item_features, item_identity_features, normalize_item_features
+            )
+
+        ratings_mat, self.user_index_, self.item_index_ = sparse_ratings(
+            ratings, scipy="coo", users=self.user_index_, items=self.item_index_
+        )
+
+        if sample_weight_col:
+            sample_weight = self._build_weights(ratings, sample_weight_col)
+        else:
+            sample_weight = None
+
+        _logger.info("fitting LightFM model")
+        self.delegate.fit_partial(
+            ratings_mat,
+            user_features=self.user_features_,
+            item_features=self.item_features_,
+            sample_weight=sample_weight,
+            **kwargs
+        )
+
+        return self
+
+    def _process_user_features(
+        self, user_features, user_identity_features, normalize_user_features
+    ):
+        if set(user_features.columns) - {"user", "feature"} not in (set(), {"value"}):
+            raise ValueError(
+                "Features must be dataframe of (user, feature) or (user, feature, value)"
+            )
+        else:
+            self._add_to_index(users_to_add=[user_features.user])
+            user_features, self.n_user_features = self._build_features(
+                self.user_index_,
                 "user",
                 user_features,
                 user_identity_features,
                 normalize_user_features,
             )
-        elif user_features is None or sps.isspmatrix_coo(item_features):
-            self.user_features_ = user_features
-        else:
-            raise TypeError(
-                "unsupported type %s for user features", type(user_features)
-            )
+        return user_features
 
-        if isinstance(item_features, pd.DataFrame):
-            items = pd.Index(
-                np.unique(pd.concat([ratings.item, item_features.item])), name="item"
-                )
-            if set(item_features.columns) - {"item", "feature"} in [set(), {"value"}]:
-                item_features_builder = self._build_features_long
-            else:
-                item_features_builder = self._build_features_wide
-            self.item_features_ = item_features_builder(
-                items,
+    def _process_item_features(
+        self, item_features, item_identity_features, normalize_item_features
+    ):
+        if set(item_features.columns) - {"item", "feature"} not in (set(), {"value"}):
+            raise ValueError(
+                "Features must be dataframe of (item, feature) or (item, feature, value)"
+            )
+        else:
+            self._add_to_index(items_to_add=[item_features.item])
+            item_features, self.n_item_features = self._build_features(
+                self.item_index_,
                 "item",
                 item_features,
                 item_identity_features,
                 normalize_item_features,
             )
-        elif item_features is None or sps.isspmatrix_coo(item_features):
-            self.item_features_ = item_features
-        else:
-            raise TypeError(
-                "unsupported type %s for item features", type(item_features)
-            )
+        return item_features
 
-        if isinstance(ratings, pd.DataFrame):
-            ratings, users, items = sparse_ratings(ratings, scipy=True, users=users, items=items)
-            ratings = ratings.tocoo()  # TODO: Change after sparse_ratings refactor
-        elif sps.isspmatrix_coo(ratings):
-            n_users, n_items = ratings.shape
-            users = pd.Index(np.arange(n_users), name="user")
-            items = pd.Index(np.arange(n_items), name="item")
-        else:
-            raise TypeError("unsupported type %s for ratings", type(ratings))
+    def _reset_state(self):
 
-        self.user_index_ = users
-        self.item_index_ = items
+        self.delegate._reset_state()
 
-        _logger.info("fitting LightFM model")
-        self.delegate.fit(ratings, **kwargs)
+        self.user_index_ = None
+        self.item_index_ = None
+        self.user_features_ = None
+        self.item_features_ = None
+        self.user_identities_ = None
+        self.item_identities_ = None
 
-        return self
+    def _build_weights(self, ratings, sample_weight_col):
+        row_ind = self.user_index_.get_indexer(ratings.user)
+        col_ind = self.item_index_.get_indexer(ratings.item)
 
-    def predict_for_user(self, user, items, ratings=None, **kwargs):
+        weights = np.require(ratings[sample_weight_col], np.float32)
+
+        n_rows, n_cols = len(self.user_index_), len(self.item_index_)
+
+        mat = sps.coo_matrix((weights, (row_ind, col_ind)), shape=(n_rows, n_cols))
+
+        return mat
+
+    def _add_to_index(self, users_to_add=None, items_to_add=None) -> None:
+        """[summary]
+
+        Keyword Arguments:
+            users_to_add {[type]} -- [description] (default: {None})
+            items_to_add {[type]} -- [description] (default: {None})
+        """
+        if users_to_add:
+            existing_user_index = self.user_index_
+            self.user_index_ = pd.Index(np.unique(pd.concat(users_to_add)), name="user")
+            if existing_user_index is not None:
+                self.user_index_ = existing_user_index.append(
+                    self.user_index_
+                ).drop_duplicates(keep="first")
+        if items_to_add:
+            existing_item_index = self.item_index_
+            self.item_index_ = pd.Index(np.unique(pd.concat(items_to_add)), name="item")
+            if existing_item_index is not None:
+                self.item_index_ = existing_item_index.append(
+                    self.item_index_
+                ).drop_duplicates(keep="first")
+
+    def predict_for_user(
+        self, user, items, user_features=None, item_features=None, **kwargs
+    ):
         """[summary]
 
         Arguments:
@@ -143,6 +236,8 @@ class LightFM(Predictor):
         uidx = self.user_index_.get_loc(user)
         iidx = self.item_index_.get_indexer(items)
 
+        # TODO: Support user/item weights over features at prediction time
+
         good = iidx >= 0  # Limit to items in model
         items = np.array(items)
         good_items = items[good]
@@ -153,30 +248,7 @@ class LightFM(Predictor):
         res = res.reindex(items)
         return res
 
-    @staticmethod
-    def _build_features_wide(idx, idx_col, features, identity_features, normalize):
-        n_rows = len(idx)
-        n_features = len(features.columns) - 1
-
-        row_indexer = idx.get_indexer(features[idx_col])
-        if np.any(row_indexer < 0):
-            raise ValueError("Entry in features dataframe missing in ratings")
-        n_entries = len(row_indexer)
-
-        row_ind = np.tile(row_indexer, n_features)
-        col_ind = np.repeat(np.arange(n_features), n_entries)
-        data = (
-            features.drop(columns=[idx_col]).to_numpy(dtype=np.float32).ravel(order="F")
-        )
-
-        mat = LightFM._build_features(
-            data, row_ind, col_ind, n_rows, n_features, identity_features, normalize
-        )
-
-        return mat
-
-    @staticmethod
-    def _build_features_long(idx, idx_col, features, identity_features, normalize):
+    def _build_features(self, idx, idx_col, features, identity_features, normalize):
         n_rows = len(idx)
         feat_idx = pd.Index(np.unique(features.feature), name="feature")
         n_features = len(feat_idx)
@@ -192,16 +264,14 @@ class LightFM(Predictor):
         else:
             data = np.ones_like(col_ind, dtype=np.float32)
 
-        mat = LightFM._build_features(
+        mat = self._build_sparse_features(
             data, row_ind, col_ind, n_rows, n_features, identity_features, normalize
         )
-        return mat
+        return mat, n_features
 
-    @staticmethod
-    def _build_features(
-        data, row_ind, col_ind, n_rows, n_features, identity_features, normalize
+    def _build_sparse_features(
+        self, data, row_ind, col_ind, n_rows, n_features, identity_features, normalize
     ):
-        import scipy.sparse as sps
 
         mat = sps.csr_matrix((data, (row_ind, col_ind)), shape=(n_rows, n_features))
 
