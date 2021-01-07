@@ -3,16 +3,17 @@ from itertools import starmap
 
 import numpy as np
 import pandas as pd
+from pandas.core.arrays.sparse import dtype
 import scipy.sparse as sps
 
+from lenskit.algorithms import Predictor
 
 from ..matrix import sparse_ratings
-from .mf_common import MFPredictor
 
 _logger = logging.getLogger(__name__)
 
 
-class LightFM(MFPredictor):
+class LightFM(Predictor):
     """Lenskit interface to :py:mod:`LightFM.lightfm`
 
     Arguments:
@@ -43,97 +44,6 @@ class LightFM(MFPredictor):
         )
         self._reset_state()
 
-    @property
-    def n_features(self):
-        "The number of features."
-        return self.delegate.no_components
-
-    @property
-    def n_users(self):
-        "The number of users."
-        return len(self.user_index_)
-
-    @property
-    def n_items(self):
-        "The number of items."
-        return len(self.item_index_)
-
-    def lookup_user(self, user):
-        """
-        Look up the index for a user.
-
-        Args:
-            user: the user ID to look up
-
-        Returns:
-            int: the user index.
-        """
-        try:
-            return self.user_index_.get_loc(user)
-        except KeyError:
-            return -1
-
-    def lookup_items(self, items):
-        """
-        Look up the indices for a set of items.
-
-        Args:
-            items(array-like): the item IDs to look up.
-
-        Returns:
-            numpy.ndarray: the item indices. Unknown items will have negative indices.
-        """
-        return self.item_index_.get_indexer(items)
-
-    def score(self, user, items, u_features=None):
-        """
-        Score a set of items for a user. User and item parameters must be indices
-        into the matrices.
-
-        Args:
-            user(int): the user index
-            items(array-like of int): the item indices
-            raw(bool): if ``True``, do return raw scores without biases added back.
-
-        Returns:
-            numpy.ndarray: the scores for the items.
-        """
-
-        # get user vector
-        uv = self.user_features_[user, :] if u_features is None else u_features
-        # get item matrix
-        im = self.item_features_[items, :]
-        rv = np.matmul(im, uv)
-        assert rv.shape[0] == len(items)
-        assert len(rv.shape) == 1
-
-        return rv
-
-    def score_by_ids(self, user, items, u_features=None):
-        if u_features is None:
-            uidx = self.lookup_user(user)
-            if uidx < 0:
-                _logger.debug('user %s not in model', user)
-                return pd.Series(np.nan, index=items)
-        else:
-            uidx = None
-
-        # get item index & limit to valid ones
-        items = np.array(items)
-        iidx = self.lookup_items(items)
-        good = iidx >= 0
-        good_items = items[good]
-        good_iidx = iidx[good]
-
-        # multiply
-        _logger.debug('scoring %d items for user %s', len(good_items), user)
-        rv = self.score(uidx, good_iidx, u_features)
-
-        res = pd.Series(rv, index=good_items)
-        res = res.reindex(items)
-        return res
-
-
     def fit(
         self,
         ratings,
@@ -150,10 +60,9 @@ class LightFM(MFPredictor):
             ratings {[type]} -- [description]
 
         Keyword Arguments:
+            sample_weight_col {[type]} -- [description] (default: {None})
             user_features {[type]} -- [description] (default: {None})
             item_features {[type]} -- [description] (default: {None})
-            user_identity_features {bool} -- [description] (default: {True})
-            item_identity_features {bool} -- [description] (default: {True})
             normalize_user_features {bool} -- [description] (default: {True})
             normalize_item_features {bool} -- [description] (default: {True})
         """
@@ -184,16 +93,11 @@ class LightFM(MFPredictor):
             ratings {[type]} -- [description]
 
         Keyword Arguments:
+            sample_weight_col {[type]} -- [description] (default: {None})
             user_features {[type]} -- [description] (default: {None})
             item_features {[type]} -- [description] (default: {None})
-            user_identity_features {bool} -- [description] (default: {True})
-            item_identity_features {bool} -- [description] (default: {True})
             normalize_user_features {bool} -- [description] (default: {True})
             normalize_item_features {bool} -- [description] (default: {True})
-            **kwargs -- arguments passed to :py:meth:`lightfm.LightFM.fit`.
-
-        Raises:
-            TypeError: [description]
 
         Returns:
             [type] -- [description]
@@ -230,7 +134,6 @@ class LightFM(MFPredictor):
         return self
 
     def _reset_state(self):
-
         self.delegate._reset_state()
         self._dataset._reset_state()
 
@@ -241,49 +144,51 @@ class LightFM(MFPredictor):
         self.user_identities_ = None
         self.item_identities_ = None
 
-    def predict_for_user(self, user, items, ratings):
-        return super().predict_for_user(user, items, ratings=ratings)
-
-    def predict(
-        self, users, items, user_features=None, item_features=None, normalize_user_features=True, normalize_item_features=True, **kwargs
-    ):
+    def predict_for_user(self, user, items, user_features=None, item_features=None):
         """[summary]
 
         Arguments:
             user {[type]} -- [description]
             items {[type]} -- [description]
-            ratings {[type]} -- [description]
+
+        Keyword Arguments:
+            user_features {[type]} -- [description] (default: {None})
+            item_features {[type]} -- [description] (default: {None})
 
         Returns:
-            [type] -- [description] NaN for items not in model.
+            [type] -- [description]
         """
-        self._dataset.partial_fit(pd.Series([user]), items, user_features, item_features)
+        df = pd.DataFrame({'user': user, 'item': items})
+        return self.predict(df, user_features, item_features).set_index('item').score
 
-        uidx = self.dataset_.user_idx_.get_indexer(user)
-        iidx = self.dataset_.item_idx_.get_indexer(items)
+    def predict(
+        self, ratings, user_features=None, item_features=None, normalize_user_features=True, normalize_item_features=True, **kwargs
+    ):
+        """[summary]
 
+        Arguments:
+            users {[type]} -- [description]
+            items {[type]} -- [description]
 
-        # Limit to users/items in model
+        Keyword Arguments:
+            user_features {[type]} -- [description] (default: {None})
+            item_features {[type]} -- [description] (default: {None})
+            normalize_user_features {bool} -- [description] (default: {True})
+            normalize_item_features {bool} -- [description] (default: {True})
 
-        good = uidx >= 0
-        users = np.array(users)
-        good_users = users[good]
-        good_uidx = uidx[good]
+        Returns:
+            [type] -- [description]
+        """
+        self._dataset.partial_fit(ratings.user, ratings.item, user_features, item_features)
 
-        good = iidx >= 0
-        items = np.array(items)
-        good_items = items[good]
-        good_iidx = iidx[good]
+        users = self.dataset_.user_idx_.get_indexer(ratings.user, dtype=np.int32)
+        items = self.dataset_.item_idx_.get_indexer(ratings.item, dtype=np.int32)
 
         ufeat_mat = self._dataset.build_user_features(user_features, normalize_user_features)
         ifeat_mat = self._dataset.build_item_features(item_features, normalize_item_features)
 
-        scores = self.delegate.predict(uidx, good_iidx, **kwargs)
-        res = pd.Series(scores, index=good_items)
-        res = res.reindex(items)
-        return res
-
-
+        scores = self.delegate.predict(users, items, user_features=ufeat_mat, item_features=ifeat_mat, **kwargs)
+        return pd.DataFrame({'user': ratings.user, 'item': ratings.item, 'score': scores})
 
 
 class LFMDataset:
@@ -296,12 +201,33 @@ class LFMDataset:
         self._reset_state()
 
     def fit(self, users, items, user_features=None, item_features=None):
+        """[summary]
+
+        Arguments:
+            users {[type]} -- [description]
+            items {[type]} -- [description]
+
+        Keyword Arguments:
+            user_features {[type]} -- [description] (default: {None})
+            item_features {[type]} -- [description] (default: {None})
+        """
         self._reset_state()
         self.partial_fit(users, items, user_features, item_features)
 
     def partial_fit(
         self, users=None, items=None, user_features=None, item_features=None
     ):
+        """[summary]
+
+        Keyword Arguments:
+            users {[type]} -- [description] (default: {None})
+            items {[type]} -- [description] (default: {None})
+            user_features {[type]} -- [description] (default: {None})
+            item_features {[type]} -- [description] (default: {None})
+
+        Returns:
+            [type] -- [description]
+        """
         user_idx, item_idx, ufeat_idx, ifeat_idx = [None] * 4
 
         if users:
@@ -317,7 +243,7 @@ class LFMDataset:
 
         self.validate_features(ufeat_idx, ifeat_idx)
 
-        self.add_to_idx(user_idx, item_idx, ufeat_idx, ifeat_idx)
+        self.add_to_idx_(user_idx, item_idx, ufeat_idx, ifeat_idx)
 
         # We can only add identity features once
         if self.user_identity_features_ and self.ufeat_identity_idx is None:
@@ -327,7 +253,7 @@ class LFMDataset:
 
         return self
 
-    def add_to_idx(self, user_idx=None, item_idx=None, ufeat_idx=None, ifeat_idx=None):
+    def add_to_idx_(self, user_idx=None, item_idx=None, ufeat_idx=None, ifeat_idx=None):
         if user_idx:
             self.user_idx_, prev_idx = user_idx, self.user_idx_
             if prev_idx:
@@ -376,12 +302,34 @@ class LFMDataset:
                 )
 
     def build_interactions(self, ratings):
+        """[summary]
+
+        Arguments:
+            ratings {[type]} -- [description]
+
+        Returns:
+            [type] -- [description]
+        """
         ratings_mat, self.user_idx_, self.item_idx_ = sparse_ratings(
             ratings, scipy="coo", users=self.user_idx_, items=self.item_idx_
         )
         return ratings_mat
 
     def build_weights(self, ratings, weight_col):
+        """[summary]
+
+        Arguments:
+            ratings {[type]} -- [description]
+            weight_col {[type]} -- [description]
+
+        Raises:
+            ValueError: [description]
+            ValueError: [description]
+            ValueError: [description]
+
+        Returns:
+            [type] -- [description]
+        """
         row_ind = self.user_idx_.get_indexer(ratings.user).astype(np.intc)
         if np.any(row_ind < 0):
             raise ValueError("Users not in mapping. Call fit or partial_fit first.")
@@ -394,18 +342,46 @@ class LFMDataset:
         else:
             vals = np.require(ratings[weight_col].values, np.float32)
 
-        weights_mat = sps.coo_matrix((vals, (row_ind, col_ind)), shape=self.get_shape())
+        weights_mat = sps.coo_matrix((vals, (row_ind, col_ind)), shape=self.shape)
 
         return weights_mat
 
-    def get_shape(self):
-        if self._user_idx_ and self.item_idx_:
-            return (len(self.user_idx_), len(self.item_idx_))
+    @property
+    def shape(self):
+        return self.get_shape_(self.user_idx_, self.item_idx_)
+
+    @property
+    def user_features_shape(self):
+        return self.get_shape_(self.user_idx_, self.ufeat_idx_)
+
+    @property
+    def item_features_shape(self):
+        return self.get_shape_(self.item_idx_, self.ifeat_idx_)
+
+    @staticmethod
+    def get_shape_(rows, cols):
+        n = len(rows) if rows else 0
+        m = len(cols) if cols else 0
+        return (n, m)
 
     def build_user_features(self, user_features, normalize):
+        """[summary]
+
+        Arguments:
+            user_features {[type]} -- [description]
+            normalize {[type]} -- [description]
+
+        Raises:
+            ValueError: [description]
+            ValueError: [description]
+            ValueError: [description]
+
+        Returns:
+            [type] -- [description]
+        """
         if not {"user", "feature"} <= set(user_features.columns):
             raise ValueError(
-                "Features must be dataframe of (user, feature) or (user, feature, value)"
+                "Features must be dataframe with 'user' and 'feature' columns"
             )
         else:
             row_ind = self.user_idx_.get_indexer(user_features.feature).astype(np.intc)
@@ -416,7 +392,7 @@ class LFMDataset:
             if np.any(col_ind < 0):
                 raise ValueError("features in user features not dataset")
 
-            shape = (len(self.user_idx_), len(self.ufeat_idx_))
+            shape = self.user_features_shape
 
             if "value" in user_features.columns:
                 data = np.require(user_features.value, dtype=np.float32)
@@ -430,9 +406,23 @@ class LFMDataset:
             )
 
     def build_item_features(self, item_features, normalize):
+        """[summary]
+
+        Arguments:
+            item_features {[type]} -- [description]
+            normalize {[type]} -- [description]
+
+        Raises:
+            ValueError: [description]
+            ValueError: [description]
+            ValueError: [description]
+
+        Returns:
+            [type] -- [description]
+        """
         if not {"item", "feature"} <= set(item_features.columns):
             raise ValueError(
-                "Features must be dataframe of (item, feature) or (item, feature, value)"
+                "Features must be dataframe with 'item' and 'feature' columns"
             )
         else:
             row_ind = self.item_idx_.get_indexer(item_features.feature).astype(np.intc)
@@ -443,7 +433,7 @@ class LFMDataset:
             if np.any(col_ind < 0):
                 raise ValueError("features in item features not dataset")
 
-            shape = (len(self.user_idx_), len(self.ufeat_idx_))
+            shape = self.item_features_shape
 
             if "value" in item_features.columns:
                 data = np.require(item_features.value, dtype=np.float32)
@@ -479,6 +469,11 @@ class LFMDataset:
         return mat
 
     def mapping(self):
+        """[summary]
+
+        Returns:
+            [type] -- [description]
+        """
         return starmap(
             self._build_mapping,
             (
@@ -492,4 +487,3 @@ class LFMDataset:
     @staticmethod
     def _build_mapping(idx, name):
         return pd.Series(np.arange(len(idx), index=idx, name=name).to_dict())
-
