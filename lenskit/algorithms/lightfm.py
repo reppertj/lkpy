@@ -3,7 +3,6 @@ from itertools import starmap
 
 import numpy as np
 import pandas as pd
-from pandas.core.arrays.sparse import dtype
 import scipy.sparse as sps
 
 from lenskit.algorithms import Predictor
@@ -14,20 +13,24 @@ _logger = logging.getLogger(__name__)
 
 
 class LightFM(Predictor):
-    """Lenskit interface to :py:mod:`LightFM.lightfm`
+    """Lenskit interface to :py:mod:`LightFM.lightfm` that handles transformations between Lenskit
+    ratings dataframes and matrix indexes. Additional arguments are passed through to LightFM.
+    Separate interactions and weight matrices are possible by including a weight column.
+    in the ratings dataframe.
 
-    Arguments:
-        args:
-        **kwargs: Arguments passed to :py:class:`lightfm.LightFM` constructor.
+    Keyword Arguments:
+        user_identity_features {bool} -- Supplement user feature matrices with identity
+            features. This has no effect if a user feature matrix is not supplied to `fit`.
+            (default: {True})
+        item_identity_features {bool} -- Supplement item feature matrices with identity
+            features. This has no effect if an item feature matrix is not supplied to `fit`.
+            (default: {True})
+        *args: positional arguments passed to :py:class:`lightfm.LightFM` constructor
+        **kwargs: keyword arguments passed to :py:class:`lightfm.LightFM` constructor.
+
     Attributes:
-        delegate(lightfm.LightFM):
-            The :py:mod:`lightfm.LightFM` delegate.
-        matrix_(scipy.sparse.coo_matrix):
-            The user-item interactions matrix.
-        user_index_(pandas.Index):
-            The user index.
-        item_idx_(pandas.Index):
-            The item index.
+        delegate(lightfm.LightFM): The :py:mod:`lightfm.LightFM` delegate.
+        _dataset(lightfm.LFMDataset): Builds interaction and feature matrices from dataframes
     """
 
     def __init__(
@@ -42,7 +45,6 @@ class LightFM(Predictor):
             user_identity_features=user_identity_features,
             item_identity_features=item_identity_features,
         )
-        self._reset_state()
 
     def fit(
         self,
@@ -54,17 +56,23 @@ class LightFM(Predictor):
         normalize_item_features=True,
         **kwargs
     ):
-        """[summary]
+        """Fit the delegate LightFM model with ratings data. A separate `sample_weight_col` can be
+        used to pass different interactions and weight matrices to LightFM, with the interactions
+        drawn from the `rating` column.
 
         Arguments:
-            ratings {[type]} -- [description]
+            ratings {[pandas.DataFrame]} -- The ratings data, with `user` and `item` columns, with
+            an optional `rating` column.
 
         Keyword Arguments:
-            sample_weight_col {[type]} -- [description] (default: {None})
-            user_features {[type]} -- [description] (default: {None})
-            item_features {[type]} -- [description] (default: {None})
-            normalize_user_features {bool} -- [description] (default: {True})
-            normalize_item_features {bool} -- [description] (default: {True})
+            sample_weight_col {[str]} -- Name of the `ratings` column to use for sample weights
+                (default: {None})
+            user_features {[pandas.DataFrame]} -- Dataframe with `user`, `feature`, and (optional)
+                `value` to generate a user feature matrix. (default: {None})
+            item_features {[pandas.DataFrame]} -- Dataframe with `item`, `feature`, and (optional)
+                `value` to generate an item feature matrix. (default: {None})
+            normalize_user_features {bool} -- Normalize user features by user (default: {True})
+            normalize_item_features {bool} -- Normalize item features by item (default: {True})
         """
         self._reset_state()
         self.partial_fit(
@@ -125,8 +133,8 @@ class LightFM(Predictor):
         _logger.info("fitting LightFM model")
         self.delegate.fit_partial(
             ratings_mat,
-            user_features=self.user_features_,
-            item_features=self.item_features_,
+            user_features=user_features,
+            item_features=item_features,
             sample_weight=sample_weight_mat,
             **kwargs
         )
@@ -136,13 +144,6 @@ class LightFM(Predictor):
     def _reset_state(self):
         self.delegate._reset_state()
         self._dataset._reset_state()
-
-        self.user_idx_ = None
-        self.item_idx_ = None
-        self.user_features_ = None
-        self.item_features_ = None
-        self.user_identities_ = None
-        self.item_identities_ = None
 
     def predict_for_user(self, user, items, user_features=None, item_features=None):
         """[summary]
@@ -162,13 +163,18 @@ class LightFM(Predictor):
         return self.predict(df, user_features, item_features).set_index('item').score
 
     def predict(
-        self, ratings, user_features=None, item_features=None, normalize_user_features=True, normalize_item_features=True, **kwargs
+        self,
+        ratings,
+        user_features=None,
+        item_features=None,
+        normalize_user_features=True,
+        normalize_item_features=True,
+        **kwargs
     ):
         """[summary]
 
         Arguments:
-            users {[type]} -- [description]
-            items {[type]} -- [description]
+            ratings {[type]} -- [description]
 
         Keyword Arguments:
             user_features {[type]} -- [description] (default: {None})
@@ -187,7 +193,9 @@ class LightFM(Predictor):
         ufeat_mat = self._dataset.build_user_features(user_features, normalize_user_features)
         ifeat_mat = self._dataset.build_item_features(item_features, normalize_item_features)
 
-        scores = self.delegate.predict(users, items, user_features=ufeat_mat, item_features=ifeat_mat, **kwargs)
+        scores = self.delegate.predict(
+            users, items, user_features=ufeat_mat, item_features=ifeat_mat, **kwargs
+            )
         return pd.DataFrame({'user': ratings.user, 'item': ratings.item, 'score': scores})
 
 
@@ -196,6 +204,12 @@ class LFMDataset:
     """
 
     def __init__(self, user_identity_features, item_identity_features):
+        """[summary]
+
+        Arguments:
+            user_identity_features {[type]} -- [description]
+            item_identity_features {[type]} -- [description]
+        """
         self.user_identity_features_ = user_identity_features
         self.item_identity_features_ = item_identity_features
         self._reset_state()
@@ -254,6 +268,14 @@ class LFMDataset:
         return self
 
     def add_to_idx_(self, user_idx=None, item_idx=None, ufeat_idx=None, ifeat_idx=None):
+        """[summary]
+
+        Keyword Arguments:
+            user_idx {[type]} -- [description] (default: {None})
+            item_idx {[type]} -- [description] (default: {None})
+            ufeat_idx {[type]} -- [description] (default: {None})
+            ifeat_idx {[type]} -- [description] (default: {None})
+        """
         if user_idx:
             self.user_idx_, prev_idx = user_idx, self.user_idx_
             if prev_idx:
@@ -302,7 +324,7 @@ class LFMDataset:
                 )
 
     def build_interactions(self, ratings):
-        """[summary]
+        """[summary] Does not validate that users and items are mapped.
 
         Arguments:
             ratings {[type]} -- [description]
@@ -338,7 +360,7 @@ class LFMDataset:
             raise ValueError("Items not in mapping. Call fit or partial_fit first.")
 
         if weight_col not in ratings.columns:
-            raise ValueError("Weight column %s not in ratings", weight_col)
+            raise ValueError("Weight column '%s' not in ratings", weight_col)
         else:
             vals = np.require(ratings[weight_col].values, np.float32)
 
@@ -388,9 +410,10 @@ class LFMDataset:
             col_ind = self.ufeat_idx_.get_indexer(user_features.feature).astype(np.intc)
 
             if np.any(row_ind < 0):
-                raise ValueError("users in features not in dataset")
+                raise ValueError("Users in features not in dataset. Call fit or partial_fit first.")
             if np.any(col_ind < 0):
-                raise ValueError("features in user features not dataset")
+                raise ValueError("Features in user features not dataset. Call fit or partial_fit "
+                                 "first.")
 
             shape = self.user_features_shape
 
@@ -461,7 +484,7 @@ class LFMDataset:
 
         if normalize:
             if np.any(mat.getnnz(1) == 0):
-                raise ValueError("Cannot normalize: Some rows have zero norm")
+                raise ValueError("Cannot normalize: Some rows have zero norm.")
             from sklearn.preprocessing import normalize
 
             mat = normalize(mat, norm="l1", copy=False)
@@ -486,4 +509,4 @@ class LFMDataset:
 
     @staticmethod
     def _build_mapping(idx, name):
-        return pd.Series(np.arange(len(idx), index=idx, name=name).to_dict())
+        return pd.Series(np.arange(len(idx)).to_dict(), index=idx, name=name)
